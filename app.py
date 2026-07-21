@@ -5,24 +5,17 @@ import pandas as pd
 import numpy as np
 import json
 
-app = FastAPI(title="Two Stage Vector Search")
+app = FastAPI()
 
-# --------------------------
-# Load datasets once
-# --------------------------
-
+# Load once
 documents = pd.read_csv("documents.csv")
 
-with open("embeddings.json", "r") as f:
+with open("embeddings.json") as f:
     embeddings = json.load(f)
 
-with open("reranker_scores.json", "r") as f:
+with open("reranker_scores.json") as f:
     reranker_scores = json.load(f)
 
-
-# --------------------------
-# Request Model
-# --------------------------
 
 class SearchRequest(BaseModel):
     query_id: str
@@ -32,107 +25,105 @@ class SearchRequest(BaseModel):
     filter: Dict[str, Any]
 
 
-# --------------------------
-# Metadata Filtering
-# --------------------------
+def apply_filter(df, filters):
 
-def apply_filters(df, filters):
+    result = df
 
-    result = df.copy()
+    for key, value in filters.items():
 
-    for field, condition in filters.items():
+        if isinstance(value, dict):
 
-        if isinstance(condition, dict):
+            if "gte" in value:
+                result = result[result[key] >= value["gte"]]
 
-            if "gte" in condition:
-                result = result[result[field] >= condition["gte"]]
+            if "lte" in value:
+                result = result[result[key] <= value["lte"]]
 
-            if "lte" in condition:
-                result = result[result[field] <= condition["lte"]]
-
-            if "in" in condition:
-                result = result[result[field].isin(condition["in"])]
+            if "in" in value:
+                result = result[result[key].isin(value["in"])]
 
         else:
-            result = result[result[field] == condition]
+            result = result[result[key] == value]
 
     return result
 
 
-# --------------------------
-# Cosine Similarity
-# --------------------------
+def cosine(q, d):
 
-def cosine_similarity(v1, v2):
+    q = np.asarray(q, dtype=np.float64)
+    d = np.asarray(d, dtype=np.float64)
 
-    a = np.array(v1, dtype=float)
-    b = np.array(v2, dtype=float)
-
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    denom = np.linalg.norm(q) * np.linalg.norm(d)
 
     if denom == 0:
         return 0.0
 
-    return float(np.dot(a, b) / denom)
+    return float(np.dot(q, d) / denom)
 
 
-# --------------------------
-# Endpoint
-# --------------------------
+@app.get("/")
+def home():
+    return {"status": "ok"}
+
 
 @app.post("/vector-search")
 def vector_search(req: SearchRequest):
 
     if req.query_id not in reranker_scores:
-        raise HTTPException(404, "Unknown query_id")
+        raise HTTPException(404, "Unknown query")
 
-    filtered_docs = apply_filters(documents, req.filter)
+    filtered = apply_filter(documents, req.filter)
 
-    similarities = []
+    stage1 = []
 
-    for _, row in filtered_docs.iterrows():
+    for _, row in filtered.iterrows():
 
-        doc_id = row["doc_id"]
+        doc_id = row.doc_id
 
-        if doc_id not in embeddings:
+        emb = embeddings.get(doc_id)
+
+        if emb is None:
             continue
 
-        score = cosine_similarity(
-            req.query_vector,
-            embeddings[doc_id]
+        sim = cosine(req.query_vector, emb)
+
+        stage1.append(
+            {
+                "doc_id": doc_id,
+                "score": sim
+            }
         )
 
-        similarities.append((doc_id, score))
-
-    # Stage 1 ranking
-    similarities.sort(
-        key=lambda x: (-x[1], x[0])
+    # Stage 1
+    stage1.sort(
+        key=lambda x: (-x["score"], x["doc_id"])
     )
 
-    stage1 = similarities[:req.top_k]
+    stage1 = stage1[:req.top_k]
 
-    rerank_table = reranker_scores[req.query_id]
+    scores = reranker_scores[req.query_id]
 
-    reranked = []
+    stage2 = []
 
-    for doc_id, _ in stage1:
+    for item in stage1:
 
-        score = rerank_table.get(doc_id, float("-inf"))
+        doc = item["doc_id"]
 
-        reranked.append((doc_id, score))
+        stage2.append(
+            {
+                "doc_id": doc,
+                "score": scores.get(doc, float("-inf"))
+            }
+        )
 
-    # Stage 2 ranking
-    reranked.sort(
-        key=lambda x: (-x[1], x[0])
+    # Stage 2
+    stage2.sort(
+        key=lambda x: (-x["score"], x["doc_id"])
     )
-
-    answer = [doc for doc, _ in reranked[:req.rerank_top_n]]
 
     return {
-        "matches": answer
+        "matches": [
+            x["doc_id"]
+            for x in stage2[:req.rerank_top_n]
+        ]
     }
-
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
